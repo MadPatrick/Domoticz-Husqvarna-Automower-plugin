@@ -313,13 +313,27 @@ class HusqvarnaPlugin:
         if self.tasks_thread and self.tasks_thread.is_alive():
             self.tasks_thread.join(timeout=10)
 
-        # Log any threads that are still alive so we can diagnose future hangs.
-        remaining = [t for t in threading.enumerate() if t is not threading.main_thread()]
+        # Log any threads still alive so we can diagnose future hangs.
+        # Exclude _DummyThread instances: those are Domoticz's own C++ worker threads
+        # that Python registers automatically when they first touch the threading API.
+        # They are not plugin threads and cannot be stopped or joined from here.
+        remaining = [
+            t for t in threading.enumerate()
+            if t is not threading.main_thread()
+            and type(t).__name__ != '_DummyThread'
+        ]
+        dummy_threads = [
+            t for t in threading.enumerate()
+            if t is not threading.main_thread()
+            and type(t).__name__ == '_DummyThread'
+        ]
         if remaining:
             for t in remaining:
-                Domoticz.Debug(f'Thread still alive after join: name={t.name!r} daemon={t.daemon} alive={t.is_alive()}')
+                Domoticz.Debug(f'Plugin thread still alive after join: name={t.name!r} daemon={t.daemon} alive={t.is_alive()}')
         else:
             Domoticz.Debug('All plugin threads have exited cleanly.')
+        for t in dummy_threads:
+            Domoticz.Debug(f'Framework thread (not a plugin thread): name={t.name!r} daemon={t.daemon} — this is a Domoticz C++ thread registered by Python, not created by the plugin.')
 
         Domoticz.Debug('Plugin stopped')
 
