@@ -313,6 +313,14 @@ class HusqvarnaPlugin:
         if self.tasks_thread and self.tasks_thread.is_alive():
             self.tasks_thread.join(timeout=10)
 
+        # Log any threads that are still alive so we can diagnose future hangs.
+        remaining = [t for t in threading.enumerate() if t is not threading.main_thread()]
+        if remaining:
+            for t in remaining:
+                Domoticz.Debug(f'Thread still alive after join: name={t.name!r} daemon={t.daemon} alive={t.is_alive()}')
+        else:
+            Domoticz.Debug('All plugin threads have exited cleanly.')
+
         Domoticz.Debug('Plugin stopped')
 
     def on_connect(self, connection: Any, status: int, description: str) -> None:
@@ -547,12 +555,13 @@ class HusqvarnaPlugin:
         during potentially slow API operations.
         """
         Domoticz.Debug('Entering tasks handler')
-            
-        while True:
+
+        while not self.stop_requested:
             try:
-                # Get task from queue (blocking)
-                task = self.tasks_queue.get(block=True)
-                    
+                # Use a timeout so stop_requested is checked at least once per second,
+                # even if no task arrives and even if an earlier exception suppressed a break.
+                task = self.tasks_queue.get(block=True, timeout=1)
+
                 # Exit signal received, or shutdown requested
                 if task is None or self.stop_requested:
                     Domoticz.Debug('Exiting task handler')
@@ -562,19 +571,18 @@ class HusqvarnaPlugin:
                             self.husqvarna_api = None
                     except AttributeError:
                         pass
-                    #self.tasks_queue.task_done() - the "finally" part is still executed...
                     break
-                        
+
                 # Process the task
                 Domoticz.Debug(f"Handling task: {task['Action']} (parameters: {task}).")
                 self._process_task(task)
 
             except queue.Empty:
-                pass # Continue loop if queue is empty 
+                pass  # Timed out waiting for a task; loop back and re-check stop_requested
             except Exception as e:
                 Domoticz.Error(f"Unexpected error in task handler: {e}")
                 log_backtrace_error(Parameters)
-                   
+
             finally:
                 # Mark task as done
                 if 'task' in locals():
