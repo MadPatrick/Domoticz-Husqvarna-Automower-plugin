@@ -195,6 +195,7 @@ class HusqvarnaPlugin:
             name='QueueThread', 
             target=self._handle_tasks
         )
+        self.tasks_thread.daemon = True
 
     def on_start(self) -> None:
         """Handle the plugin startup process."""
@@ -280,22 +281,24 @@ class HusqvarnaPlugin:
         """Handle the plugin shutdown process."""
         Domoticz.Debug('onStop called')
         self.stop_requested = True
-        
+
+        # Close the HTTP session from the main thread immediately.
+        # This sets session=None so the stop-guard in _http_with_retry fires
+        # at the next retry boundary, and closes the connection pool so any
+        # in-flight request fails quickly instead of waiting for the full timeout.
+        if self.husqvarna_api:
+            self.husqvarna_api.close()
+
         # Signal queue thread to exit
         self.tasks_queue.put(None)
-        
-        # Wait for thread to exit
-        if self.tasks_thread and self.tasks_thread.is_alive():
-            self.tasks_thread.join(timeout=10) # Added timeout for graceful shutdown
 
-        # Wait until queue thread has exited
-        Domoticz.Debug(f'Threads still active: {threading.active_count()} (should be 1)')
-        end_time = time.time() + 70
-        while (threading.active_count() > 1) and (time.time() < end_time):
-            for thread in threading.enumerate():
-                if thread.name != threading.current_thread().name:
-                    Domoticz.Debug(f'Thread {thread.name} is still running, waiting to prevent Domoticz abort on exit.')
-            time.sleep(1.0)
+        # Wait up to 10 s for the thread to exit gracefully.
+        # With the session already closed the thread should exit within one
+        # HTTP-timeout cycle (≤8 s) plus sentinel pickup.
+        # The thread is also a daemon, so it will not prevent process exit
+        # if the join times out.
+        if self.tasks_thread and self.tasks_thread.is_alive():
+            self.tasks_thread.join(timeout=10)
 
         Domoticz.Debug('Plugin stopped')
 
