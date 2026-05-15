@@ -289,6 +289,19 @@ class HusqvarnaPlugin:
         if self.husqvarna_api:
             self.husqvarna_api.close()
 
+        # Drain any pending tasks so the None sentinel is picked up immediately
+        # instead of the thread processing a backlog of tasks first.
+        drained = 0
+        while True:
+            try:
+                self.tasks_queue.get_nowait()
+                self.tasks_queue.task_done()
+                drained += 1
+            except queue.Empty:
+                break
+        if drained:
+            Domoticz.Debug(f'Drained {drained} pending task(s) from queue on shutdown.')
+
         # Signal queue thread to exit
         self.tasks_queue.put(None)
 
@@ -540,8 +553,8 @@ class HusqvarnaPlugin:
                 # Get task from queue (blocking)
                 task = self.tasks_queue.get(block=True)
                     
-                # Exit signal received
-                if task is None:
+                # Exit signal received, or shutdown requested
+                if task is None or self.stop_requested:
                     Domoticz.Debug('Exiting task handler')
                     try:
                         if self.husqvarna_api:
