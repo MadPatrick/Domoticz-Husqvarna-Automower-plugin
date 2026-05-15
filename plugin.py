@@ -188,7 +188,7 @@ class HusqvarnaPlugin:
         self.speed_status = UpdateSpeed.NORMAL
         self.system_retries = 0
         self.execution_status = {}  # type: Dict[str, ExecutionState]
-        self.Husqvarna_api = None   # type: Optional[Husqvarna.Husqvarna]
+        self.husqvarna_api = None   # type: Optional[Husqvarna.Husqvarna]
         self.config = MowerConfig()
         self.tasks_queue = queue.Queue()
         self.tasks_thread = threading.Thread(
