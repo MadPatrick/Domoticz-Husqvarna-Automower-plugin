@@ -195,6 +195,7 @@ class HusqvarnaPlugin:
             name='QueueThread', 
             target=self._handle_tasks
         )
+        self.tasks_thread.daemon = True
 
     def on_start(self) -> None:
         """Handle the plugin startup process."""
@@ -280,22 +281,59 @@ class HusqvarnaPlugin:
         """Handle the plugin shutdown process."""
         Domoticz.Debug('onStop called')
         self.stop_requested = True
-        
+
+        # Close the HTTP session from the main thread immediately.
+        # This sets session=None so the stop-guard in _http_with_retry fires
+        # at the next retry boundary, and closes the connection pool so any
+        # in-flight request fails quickly instead of waiting for the full timeout.
+        if self.husqvarna_api:
+            self.husqvarna_api.close()
+
+        # Drain any pending tasks so the None sentinel is picked up immediately
+        # instead of the thread processing a backlog of tasks first.
+        drained = 0
+        while True:
+            try:
+                self.tasks_queue.get_nowait()
+                self.tasks_queue.task_done()
+                drained += 1
+            except queue.Empty:
+                break
+        if drained:
+            Domoticz.Debug(f'Drained {drained} pending task(s) from queue on shutdown.')
+
         # Signal queue thread to exit
         self.tasks_queue.put(None)
-        
-        # Wait for thread to exit
-        if self.tasks_thread and self.tasks_thread.is_alive():
-            self.tasks_thread.join(timeout=10) # Added timeout for graceful shutdown
 
-        # Wait until queue thread has exited
-        Domoticz.Debug(f'Threads still active: {threading.active_count()} (should be 1)')
-        end_time = time.time() + 70
-        while (threading.active_count() > 1) and (time.time() < end_time):
-            for thread in threading.enumerate():
-                if thread.name != threading.current_thread().name:
-                    Domoticz.Debug(f'Thread {thread.name} is still running, waiting to prevent Domoticz abort on exit.')
-            time.sleep(1.0)
+        # Wait up to 10 s for the thread to exit gracefully.
+        # With the session already closed the thread should exit within one
+        # HTTP-timeout cycle (≤8 s) plus sentinel pickup.
+        # The thread is also a daemon, so it will not prevent process exit
+        # if the join times out.
+        if self.tasks_thread and self.tasks_thread.is_alive():
+            self.tasks_thread.join(timeout=10)
+
+        # Log any threads still alive so we can diagnose future hangs.
+        # Exclude _DummyThread instances: those are Domoticz's own C++ worker threads
+        # that Python registers automatically when they first touch the threading API.
+        # They are not plugin threads and cannot be stopped or joined from here.
+        remaining = [
+            t for t in threading.enumerate()
+            if t is not threading.main_thread()
+            and type(t).__name__ != '_DummyThread'
+        ]
+        dummy_threads = [
+            t for t in threading.enumerate()
+            if t is not threading.main_thread()
+            and type(t).__name__ == '_DummyThread'
+        ]
+        if remaining:
+            for t in remaining:
+                Domoticz.Debug(f'Plugin thread still alive after join: name={t.name!r} daemon={t.daemon} alive={t.is_alive()}')
+        else:
+            Domoticz.Debug('All plugin threads have exited cleanly.')
+        for t in dummy_threads:
+            Domoticz.Debug(f'Framework thread (not a plugin thread): name={t.name!r} daemon={t.daemon} — this is a Domoticz C++ thread registered by Python, not created by the plugin.')
 
         Domoticz.Debug('Plugin stopped')
 
@@ -531,14 +569,15 @@ class HusqvarnaPlugin:
         during potentially slow API operations.
         """
         Domoticz.Debug('Entering tasks handler')
-            
-        while True:
+
+        while not self.stop_requested:
             try:
-                # Get task from queue (blocking)
-                task = self.tasks_queue.get(block=True)
-                    
-                # Exit signal received
-                if task is None:
+                # Use a timeout so stop_requested is checked at least once per second,
+                # even if no task arrives and even if an earlier exception suppressed a break.
+                task = self.tasks_queue.get(block=True, timeout=1)
+
+                # Exit signal received, or shutdown requested
+                if task is None or self.stop_requested:
                     Domoticz.Debug('Exiting task handler')
                     try:
                         if self.husqvarna_api:
@@ -546,19 +585,18 @@ class HusqvarnaPlugin:
                             self.husqvarna_api = None
                     except AttributeError:
                         pass
-                    #self.tasks_queue.task_done() - the "finally" part is still executed...
                     break
-                        
+
                 # Process the task
                 Domoticz.Debug(f"Handling task: {task['Action']} (parameters: {task}).")
                 self._process_task(task)
 
             except queue.Empty:
-                pass # Continue loop if queue is empty 
+                pass  # Timed out waiting for a task; loop back and re-check stop_requested
             except Exception as e:
                 Domoticz.Error(f"Unexpected error in task handler: {e}")
                 log_backtrace_error(Parameters)
-                   
+
             finally:
                 # Mark task as done
                 if 'task' in locals():

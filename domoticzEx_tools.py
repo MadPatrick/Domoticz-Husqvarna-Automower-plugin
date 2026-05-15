@@ -456,13 +456,13 @@ def domoticz_api(parameters: Dict[str, str], params: Dict[str, Any]) -> Optional
     Returns:
         Optional[Dict[str, Any]]: JSON response from API or None if failed
     """
-    import httpx
+    import requests
 
     url = f"http://{parameters['Address']}:{parameters['Port']}/json.htm"
 
     try:
         # Make the API request
-        response = httpx.get(
+        response = requests.get(
             url, 
             params=params, 
             auth=(parameters['Username'], parameters['Password']), 

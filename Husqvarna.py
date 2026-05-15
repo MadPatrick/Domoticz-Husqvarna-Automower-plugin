@@ -15,7 +15,7 @@ Version: 2.0.0
 """
 
 import time
-import httpx
+import requests
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, Union, Tuple, cast
 from enum import Enum
@@ -325,19 +325,19 @@ class Husqvarna:
         """Context manager exit - ensure the session is closed."""
         self.close()
 
-    def _create_session(self) -> httpx.Client:
+    def _create_session(self) -> requests.Session:
         """
         Create an HTTP session for API communication.
         Returns:
-            httpx.Client: Configured HTTP client
+            requests.Session: Configured HTTP client
         """
-        return httpx.Client(
-            verify=False,
-            headers={
-                'x-api-key': self.client_id,
-                'accept': 'application/vnd.api+json'
-            }
-        )
+        session = requests.Session()
+        session.verify = False
+        session.headers.update({
+            'x-api-key': self.client_id,
+            'accept': 'application/vnd.api+json'
+        })
+        return session
 
     def get_mowers(self) -> bool:
         """
@@ -809,7 +809,7 @@ class Husqvarna:
 
     def _analyze_http_error(
         self, 
-        response: httpx.Response, 
+        response: requests.Response, 
         url: str, 
         mower_name: Optional[str] = None
     ) -> str:
@@ -839,7 +839,7 @@ class Husqvarna:
             else:
                 return f"({mower_name or 'Unknown'} - {response.status_code}) Uncaptured error returned by Husqvarna API (url: {url})"
                 
-        except (httpx.JSONDecodeError, json.JSONDecodeError):
+        except ValueError:
             # Handle non-JSON responses
             return f"({mower_name or 'Unknown'} - {response.status_code}) Uncaptured error returned by Husqvarna API (url: {url}, response: {response.text}) - JSON decode error"
             
@@ -930,7 +930,7 @@ class Husqvarna:
                     self.state.error = f'HTTP error ({response.status_code}) not specifically handled.'
                     break
 
-            except (httpx.TimeoutException, httpx.ConnectError, httpx.RequestError) as e:
+            except requests.exceptions.RequestException as e:
                 # Connection and timeout errors
                 self.state.error = f'Retry {retry_counter} - Connection error to url {url} with error "{e}".\n'
                 log(self.state.error.strip())
@@ -950,7 +950,7 @@ class Husqvarna:
         if execution_status and response is not None:
             try:
                 return response.json()
-            except (json.JSONDecodeError, httpx.JSONDecodeError) as e:
+            except ValueError as e:
                 log(f"Error parsing JSON response: {e}")
                 self.state.error = f"Error parsing JSON response: {e}"
                 return None
