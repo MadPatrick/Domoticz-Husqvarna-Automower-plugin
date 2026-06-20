@@ -839,7 +839,7 @@ class Husqvarna:
             else:
                 return f"({mower_name or 'Unknown'} - {response.status_code}) Uncaptured error returned by Husqvarna API (url: {url})"
                 
-        except (httpx.JSONDecodeError, json.JSONDecodeError):
+        except json.JSONDecodeError:
             # Handle non-JSON responses
             return f"({mower_name or 'Unknown'} - {response.status_code}) Uncaptured error returned by Husqvarna API (url: {url}, response: {response.text}) - JSON decode error"
             
@@ -950,7 +950,7 @@ class Husqvarna:
         if execution_status and response is not None:
             try:
                 return response.json()
-            except (json.JSONDecodeError, httpx.JSONDecodeError) as e:
+            except json.JSONDecodeError as e:
                 log(f"Error parsing JSON response: {e}")
                 self.state.error = f"Error parsing JSON response: {e}"
                 return None

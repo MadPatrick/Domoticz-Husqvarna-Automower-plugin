@@ -40,10 +40,10 @@ import Husqvarna
 
 # XML plugin configuration
 """
-<plugin key="Husqvarna" name="Husqvarna" author="Filip Demaertelaere" version="2.1.3">
+<plugin key="Husqvarna" name="Husqvarna" author="Filip Demaertelaere" version="2.1.4">
     <description>
         <h2>Husqvarna</h2>
-        <p>Version 2.1.3</p>
+        <p>Version 2.1.4</p>
         <p>The Husqvarna plugin for Domoticz provides seamless integration with your Husqvarna robotic lawnmowers. Leveraging the official Husqvarna API, this plugin allows you to monitor your mower's status and control key functions directly from your Domoticz environment. It creates virtual devices for each connected mower, offering real-time insights into its activity, battery level, cutting height, and precise location.</p>
         <br/>
         <h2>Key features</h2>
@@ -55,6 +55,7 @@ import Husqvarna
             <li><b>Cutting Height Adjustment:</b> Remotely set the cutting height of your mower.</li>
             <li><b>Next Schedule:</b> Shows the next upcoming scheduled mowing session.</li>
             <li><b>Zone Management:</b> Define custom zones for your property to get distance information and easily identify which zone your mower is currently in.</li>
+            <li><b>Night Mode:</b> Automatically reduces polling frequency during configurable night hours to save API quota.</li>
         </ul>
         <p>The RUN device generates a command <b>resume schedule</b> (ON) and <b>park until further notice</b> (OFF). For a fluent integration and the ability to use the timer mechanism of Domoticz to manage the Husqvarna mower, define a full-day schedule (00:00-24:00) on the mower or in the Husqvarna app for the complete week.</p>
         <br/>
@@ -74,6 +75,7 @@ import Husqvarna
             <li><b>height_min_max (cm):</b> Convertion table of the mowing height steps to centimeter. The number of steps can be found in the Husqvarna Mower App.</li>
             <li><b>update_interval (min):</b> Definition of interval time for mower updates in special cases/periods (eg mower is OFF, quota errors, ...).</li>
             <li><b>start_duration (min):</b> Mowing duration assigned to the "Start mowing" command.</li>
+            <li><b>night_mode:</b> Optional. Defines the night period during which polling is slowed down. "start" and "end" are hours (0-23), "interval" is the polling interval in minutes during the night.</li>
         </ul>
         <br/>
         <h3>Example Husqvarna.json</h3>
@@ -85,11 +87,11 @@ import Husqvarna
     ],
     "height_min_max (cm)": { "min": 2, "max": 6, "steps": 9 },
     "update_interval (min)": { "off": 60, "cloud_error": 180, "quota_error": 30 },
-    "start_duration (min)": 360 
-
+    "start_duration (min)": 360,
+    "night_mode": { "start": 22, "end": 6, "interval": 60 }
 }
         </code></pre>
-        <p>If this file is not present or is invalid, the plugin will revert to default values for zones (using Domoticz's configured title/location) and cutting height (min: 2, max: 6, steps: 9).</p>
+        <p>If this file is not present or is invalid, the plugin will revert to default values for zones (using Domoticz's configured title/location) and cutting height (min: 2, max: 6, steps: 9). Night mode defaults to 22:00-06:00 with a 60-minute interval if not specified.</p>
     </description>
     <params>
         <param field="Mode1" label="Client_id" width="250px" required="true" default=""/>
@@ -169,6 +171,7 @@ class MowerConfig:
     height_min_max: Dict[str, Any] = field(default_factory=dict)
     update_interval: Dict[str, Any] = field(default_factory=dict)
     start_duration: int = field(default_factory=int)
+    night_mode: Dict[str, Any] = field(default_factory=dict)  # Night mode configuration
 
 @dataclass
 class ExecutionState:
@@ -188,7 +191,7 @@ class HusqvarnaPlugin:
         self.speed_status = UpdateSpeed.NORMAL
         self.system_retries = 0
         self.execution_status = {}  # type: Dict[str, ExecutionState]
-        self.husqvarna_api = None   # type: Optional[Husqvarna.Husqvarna]
+        self.Husqvarna_api = None   # type: Optional[Husqvarna.Husqvarna]
         self.config = MowerConfig()
         self.tasks_queue = queue.Queue()
         self.tasks_thread = threading.Thread(
@@ -235,6 +238,7 @@ class HusqvarnaPlugin:
             default_height_min_max = {"min": 2, "max": 6, "steps": 9}
             default_update_interval = { "off": 60, "cloud_error": 180, "quota_error": 30 }
             default_start_duration = 360
+            default_night_mode = {"start": 22, "end": 6, "interval": 60}
 
             position_parts = Settings['Location'].split(';')
             # Check if position_parts has at least two elements and they can be converted to float
@@ -247,6 +251,7 @@ class HusqvarnaPlugin:
             self.config.zones = default_zones
             self.config.update_interval = default_update_interval
             self.config.start_duration = default_start_duration
+            self.config.night_mode = default_night_mode
         
             if config_file_path.exists():
                 with open(config_file_path, 'r') as json_file:
@@ -255,12 +260,17 @@ class HusqvarnaPlugin:
                 self.config.height_min_max = config_data.get('height_min_max (cm)', default_height_min_max)
                 self.config.update_interval = config_data.get('update_interval (min)', default_update_interval)
                 self.config.start_duration = config_data.get('start_duration (min)', default_start_duration)
-                Domoticz.Debug(f'Zones found: {self.config.zones}.')
-                Domoticz.Debug(f'Cutting height range found: {self.config.height_min_max}.')
-                Domoticz.Debug(f'Update interval settings found: {self.config.update_interval}.')
-                Domoticz.Debug(f'Start duration setting found: {self.config.start_duration}.')
+                self.config.night_mode = config_data.get('night_mode', default_night_mode)
+                Domoticz.Status(f'Configuration loaded from {config_file_path.name}:')
+                zone_names = ', '.join(z.get('name', '?') for z in self.config.zones) if self.config.zones else 'none'
+                Domoticz.Status(f'  Zones               : {zone_names}')
+                Domoticz.Status(f'  Cutting height (cm) : min={self.config.height_min_max.get("min")}, max={self.config.height_min_max.get("max")}, steps={self.config.height_min_max.get("steps")}')
+                Domoticz.Status(f'  Update intervals    : off={self.config.update_interval.get("off")} min, cloud_error={self.config.update_interval.get("cloud_error")} min, quota_error={self.config.update_interval.get("quota_error")} min')
+                Domoticz.Status(f'  Start duration      : {self.config.start_duration} min')
+                Domoticz.Status(f'  Night mode          : {self.config.night_mode.get("start", 22):02d}:00 - {self.config.night_mode.get("end", 6):02d}:00, interval={self.config.night_mode.get("interval", 60)} min')
             else:
-                Domoticz.Debug("Husqvarna.json not found, using default zones, cutting height, update intervals and start duration.")
+                Domoticz.Status(f'Configuration file {config_file_path.name} not found, using defaults.')
+                Domoticz.Debug("Husqvarna.json not found, using default zones, cutting height, update intervals, start duration and night mode.")
 
         except json.JSONDecodeError as err:
             Domoticz.Error(f"Error parsing configuration file: {err}; using default zones and cutting height.")
@@ -277,26 +287,19 @@ class HusqvarnaPlugin:
                 Domoticz.Debug(f"Created {image_id} image")
 
     def on_stop(self) -> None:
-        """Handle the plugin shutdown process."""
         Domoticz.Debug('onStop called')
         self.stop_requested = True
-        
+
         # Signal queue thread to exit
         self.tasks_queue.put(None)
-        
-        # Wait for thread to exit
+
+        # Wait only for our own thread, not all threads in the process
         if self.tasks_thread and self.tasks_thread.is_alive():
-            self.tasks_thread.join(timeout=10) # Added timeout for graceful shutdown
+            self.tasks_thread.join(timeout=15)
+            if self.tasks_thread.is_alive():
+                Domoticz.Debug('Task thread did not stop within timeout, continuing shutdown.')
 
-        # Wait until queue thread has exited
         Domoticz.Debug(f'Threads still active: {threading.active_count()} (should be 1)')
-        end_time = time.time() + 70
-        while (threading.active_count() > 1) and (time.time() < end_time):
-            for thread in threading.enumerate():
-                if thread.name != threading.current_thread().name:
-                    Domoticz.Debug(f'Thread {thread.name} is still running, waiting to prevent Domoticz abort on exit.')
-            time.sleep(1.0)
-
         Domoticz.Debug('Plugin stopped')
 
     def on_connect(self, connection: Any, status: int, description: str) -> None:
@@ -474,54 +477,100 @@ class HusqvarnaPlugin:
                     else:
                         Domoticz.Debug(f"No action defined for retry for mower {mower_name}. Skipping retry.")
 
+    def _is_night_time(self) -> bool:
+        """
+        Check whether the current time falls within the configured night period.
+        Handles overnight ranges (e.g. 22:00 - 06:00) correctly.
+        """
+        hour = datetime.datetime.now().hour
+        start = self.config.night_mode.get('start', 22)
+        end = self.config.night_mode.get('end', 6)
+
+        if start > end:
+            # Overnight range: e.g. 22 -> 06 (crosses midnight)
+            return hour >= start or hour < end
+        elif start < end:
+            # Same-day range: e.g. 01 -> 05
+            return start <= hour < end
+        else:
+            # start == end: night mode disabled (zero-length window)
+            return False
+
     def _adjust_update_frequency(self) -> None:
         """
         Adjust the update frequency based on:
-        1. Errors from Husqvarna Cloud
-        2. API rate limits
-        3. Whether all mowers are off
-        4. Going home
+        1. Night mode (quiet hours)
+        2. Errors from Husqvarna Cloud
+        3. API rate limits
+        4. Whether all mowers are off
+        5. Going home (temporary speed boost)
         """
         now = datetime.datetime.now()
-        hours = now.hour
-        
-        if self.system_retries > 5:
-            # Too many errors from Husqvarna server received
-            self.run_again = self.config.update_interval.get('cloud_error', 180) * DomoticzConstants.MINUTE
 
+        # --- Night mode: checked first, highest priority after errors ---
+        if self._is_night_time():
+            interval = self.config.night_mode.get('interval', 60)
+            self.run_again = interval * DomoticzConstants.MINUTE
+            if self.speed_status != UpdateSpeed.NIGHT:
+                Domoticz.Status(
+                    f'Night mode active: polling slowed to {interval} minutes '
+                    f'(night window {self.config.night_mode.get("start", 22):02d}:00 - '
+                    f'{self.config.night_mode.get("end", 6):02d}:00).'
+                )
+                self.speed_status = UpdateSpeed.NIGHT
+            return  # Skip all other checks during night
+
+        # --- Cloud / system errors ---
+        if self.system_retries > 5:
+            self.run_again = self.config.update_interval.get('cloud_error', 180) * DomoticzConstants.MINUTE
             if self.speed_status != UpdateSpeed.SYSTEM_ERROR:
-                Domoticz.Status(f'Reduce status update speed to {self.run_again/DomoticzConstants.MINUTE} minutes because of too many errors from Husqvarna Cloud.')
+                Domoticz.Status(
+                    f'Reduce status update speed to {self.run_again / DomoticzConstants.MINUTE} minutes '
+                    f'because of too many errors from Husqvarna Cloud.'
+                )
                 self.speed_status = UpdateSpeed.SYSTEM_ERROR
-                
+
+        # --- API quota / rate limits exceeded ---
         elif self.husqvarna_api and self.husqvarna_api.are_api_limits_reached():
-            # API limits reached - slow down significantly
             self.run_again = self.config.update_interval.get('quota_error', 30) * DomoticzConstants.MINUTE
-            
             if self.speed_status != UpdateSpeed.LIMITS_EXCEEDED:
-                Domoticz.Status(f'Reduce status update speed to {self.run_again/DomoticzConstants.MINUTE} minutes as Husqvarna API limits are reached!')
+                Domoticz.Status(
+                    f'Reduce status update speed to {self.run_again / DomoticzConstants.MINUTE} minutes '
+                    f'as Husqvarna API limits are reached!'
+                )
                 self.speed_status = UpdateSpeed.LIMITS_EXCEEDED
-                
+
+        # --- All mowers are off (e.g. winter storage) ---
         elif self.husqvarna_api and self.husqvarna_api.mowers and self.husqvarna_api.are_all_mowers_off():
-            # (only in case there are mowers in the list) All mowers off - check once per hour
-            self.run_again = self.config.update_interval.get('off', 180) * DomoticzConstants.MINUTE
-            
+            self.run_again = self.config.update_interval.get('off', 60) * DomoticzConstants.MINUTE
             if self.speed_status != UpdateSpeed.ALL_OFF:
-                Domoticz.Status(f'Reduce status update speed to {self.run_again/DomoticzConstants.MINUTE} minutes as all Husqvarna mowers are off.')
+                Domoticz.Status(
+                    f'Reduce status update speed to {self.run_again / DomoticzConstants.MINUTE} minutes '
+                    f'as all Husqvarna mowers are off.'
+                )
                 self.speed_status = UpdateSpeed.ALL_OFF
 
-        elif self.husqvarna_api and any(m.get('activity', '') == 'GOING_HOME' for m in self.husqvarna_api.mowers if isinstance(m, dict)): # Added type check for 'm'
-            configured_interval_minutes = float(Parameters.get('Mode5', '1').replace(',','.'))
+        # --- Temporary speed boost: mower is heading home ---
+        elif self.husqvarna_api and any(
+            m.get('activity', '') == 'GOING_HOME'
+            for m in self.husqvarna_api.mowers
+            if isinstance(m, dict)
+        ):
             self.run_again = DomoticzConstants.MINUTE
-            # No specific speed_status change for this, it's a temporary boost
-            Domoticz.Debug(f"Increasing update speed to {self.run_again / DomoticzConstants.MINUTE} minutes as a mower is going home.")
-        
+            Domoticz.Debug(
+                f'Increasing update speed to {self.run_again / DomoticzConstants.MINUTE} minute(s) '
+                f'as a mower is going home.'
+            )
+            # No speed_status change; this is a transient boost
+
+        # --- Normal daytime operation ---
         else:
-            # Normal operation - use configured interval
-            configured_interval_minutes = float(Parameters.get('Mode5', '1').replace(',','.'))
+            configured_interval_minutes = float(Parameters.get('Mode5', '1').replace(',', '.'))
             self.run_again = DomoticzConstants.MINUTE * configured_interval_minutes
-            
             if self.speed_status != UpdateSpeed.NORMAL:
-                Domoticz.Status(f'Re-establish normal update speed to {self.run_again/DomoticzConstants.MINUTE} minutes.')
+                Domoticz.Status(
+                    f'Re-establish normal update speed to {self.run_again / DomoticzConstants.MINUTE} minutes.'
+                )
                 self.speed_status = UpdateSpeed.NORMAL
 
     def _handle_tasks(self) -> None:
@@ -698,63 +747,73 @@ class HusqvarnaPlugin:
         error_state = mower.get('error_state', '')
         state = mower.get('state', '')
         activity = mower.get('activity', '')
-        restricted_reason = mower.get('restricted_reason', '')
+        planner = mower.get('planner', {}) or {}
+        restricted_reason = planner.get('restricted_reason', '')
 
         state_str = getattr(Husqvarna.State, state, Husqvarna.State.UNKNOWN).value
         activity_str = getattr(Husqvarna.Activity, activity, Husqvarna.Activity.UNKNOWN).value
         restricted_reason_str = getattr(Husqvarna.PlannerRestrictedReason, restricted_reason, Husqvarna.PlannerRestrictedReason.NONE).value
 
+        # When parked in charging station, show "Parked in base until <next schedule>"
+        if activity == Husqvarna.Activity.PARKED_IN_CS.name:
+            next_schedule = self._format_next_schedule_label(mower)
+            if next_schedule and next_schedule != 'No schedule':
+                return f"Parked until {next_schedule}"
+            else:
+                return activity_str
+
         base_str = f"{state_str}: {activity_str}" if activity != Husqvarna.Activity.NOT_APPLICABLE.name else f"{state_str}"
 
         if error_state:
             return f"{base_str}\n<body><p style=\"line-height:80%;font-size:80%;\">{error_state.strip()}</p></body>"
-
         else:
             if restricted_reason:
-                return f"{base_str}\n<body><p style=\"line-height:80%;font-size:80%;\">{restricted_str}</p></body>"
-            else:
-                return base_str
+                if ( reason_text := getattr(Husqvarna.PlannerRestrictedReason, restricted_reason, Husqvarna.PlannerRestrictedReason.NONE).value ):
+                    return f"{base_str}\n<body><p style=\"line-height:80%;font-size:80%;\">{reason_text}</p></body>"
+            return base_str
 
-    def _format_next_schedule_text(self, mower: Dict[str, Any]) -> str:
+    def _format_next_schedule_label(self, mower: Dict[str, Any]) -> str:
         """
-        Format the next scheduled mowing session as readable text.
-        Uses nextStartTimestamp from the Husqvarna planner API (milliseconds).
-        Note: Husqvarna API returns local time in the timestamp, not UTC.
-        utcfromtimestamp is used intentionally to avoid double timezone conversion.
+        Return a plain 'Day HH:MM' label for the next schedule (no HTML).
+        Returns empty string if no schedule is available.
         """
-        planner = mower.get('planner', {})
+        planner = mower.get('planner', {}) or {}
         timestamp_ms = planner.get('next_start_timestamp', None)
-        restricted_reason = planner.get('restricted_reason', '')
-
-        # Default value
-        result = 'No schedule'
-
-        # No schedule available 
         if not timestamp_ms:
-            return result
-
-        # Schedule available
+            return ''
         try:
-            # Husqvarna API provides timestamp in local time despite being milliseconds epoch.
-            # utcfromtimestamp avoids applying an additional local timezone offset.
             slot_dt = datetime.datetime.utcfromtimestamp(timestamp_ms / 1000)
             now = datetime.datetime.now()
-
             if slot_dt.date() == now.date():
                 day_label = 'Today'
             elif slot_dt.date() == (now + datetime.timedelta(days=1)).date():
                 day_label = 'Tomorrow'
             else:
                 day_label = slot_dt.strftime('%A')
-
-            result = f'{day_label} {slot_dt.strftime("%H:%M")}'
-
-            if restricted_reason is not Husqvarna.PlannerRestrictedReason.NONE.name:
-                if ( reason_text := getattr(Husqvarna.PlannerRestrictedReason, restricted_reason, Husqvarna.PlannerRestrictedReason.NONE).value ):
-                    result += f"\n<body><p style=\"line-height:80%;font-size:80%;\">{reason_text}</p></body>"
-
+            return f'{day_label} {slot_dt.strftime("%H:%M")}'
         except Exception as e:
-            Domoticz.Debug(f"Error formatting schedule text: {e}")
+            Domoticz.Debug(f"Error formatting schedule label: {e}")
+            return ''
+
+    def _format_next_schedule_text(self, mower: Dict[str, Any]) -> str:
+        """
+        Format the next scheduled mowing session as readable text (with optional HTML subtitle).
+        Uses nextStartTimestamp from the Husqvarna planner API (milliseconds).
+        Note: Husqvarna API returns local time in the timestamp, not UTC.
+        utcfromtimestamp is used intentionally to avoid double timezone conversion.
+        """
+        planner = mower.get('planner', {}) or {}
+        restricted_reason = planner.get('restricted_reason', '')
+
+        label = self._format_next_schedule_label(mower)
+        if not label:
+            return 'No schedule'
+
+        result = label
+
+        if restricted_reason is not Husqvarna.PlannerRestrictedReason.NONE.name:
+            if ( reason_text := getattr(Husqvarna.PlannerRestrictedReason, restricted_reason, Husqvarna.PlannerRestrictedReason.NONE).value ):
+                result += f"\n<body><p style=\"line-height:80%;font-size:80%;\">{reason_text}</p></body>"
 
         return result
 
@@ -768,12 +827,13 @@ class HusqvarnaPlugin:
             return Husqvarna.Activity.PARKED_IN_CS.value
 
         location_data = mower.get('location')
-        if location_data and location_data.get('latitude', None) is not None and location_data.get('longitude', None) is not None:
+        if location_data and location_data.get('latitude') is not None and location_data.get('longitude') is not None:
             # Pass only the necessary parts of location to _find_nearest_zone
             return self._find_nearest_zone({'latitude': location_data['latitude'], 'longitude': location_data['longitude']})
         else:
-            # Return current device s_value if no valid location, or "Unknown"
-            return "Unknown"
+            # No GPS location available (e.g. mower is in charging station): return activity as fallback
+            activity = mower.get('activity', '')
+            return getattr(Husqvarna.Activity, activity, Husqvarna.Activity.UNKNOWN).value
 
     def _find_nearest_zone(self, position: Dict[str, float]) -> str:
         """Find the nearest zone based on GPS coordinates."""

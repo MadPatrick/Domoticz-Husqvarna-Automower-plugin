@@ -1,9 +1,11 @@
 {
-"height_min_max (cm)": {"min": 2, "max": 6, "steps": 9},
+"height_min_max (cm)": {"min": 2, "max": 6, "steps": 5},
 "update_interval (min)": { "off": 60, "cloud_error": 180, "quota_error": 30 },
-"start_duration (min)": 420,
+"start_duration (min)": 120,
+"night_mode": { "start": 22, "end": 6, "interval": 60 },
 "zones": [
-    {"name": "Front garden", "latitude": xx.yy, "longitude": xx.yy},
-    {"name": "Back garden", "latitude": xx.yy, "longitude": xx.yy},
+    {"name": "Tuin", "latitude":51.8316, "longitude": 4.1244},
+    {"name": "Achter", "latitude":51.8315, "longitude": 4.1245}
     ]
 }
+
