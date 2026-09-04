@@ -409,6 +409,8 @@ class HusqvarnaPlugin:
             # Check if we need to prevent starting when charging
             if action.startswith(HusqvarnaAction.START.value) and mower.get('activity') == Husqvarna.Activity.CHARGING.name:
                 exec_state.status = ExecutionStatus.DONE.value
+                mower_name = mower['name']
+                image = Images[ImageIdentifier.OFF.value].ID if mower.get('state') == Husqvarna.State.OFF.name else Images[ImageIdentifier.STANDARD.value].ID
                 update_device(False, Devices, mower_name, UnitId.ACTIONS, 2, 10, Image=image)
                 Domoticz.Status(f"Mower {mower['name']} cannot be started as it is still charging.")
             else:
