@@ -40,10 +40,10 @@ import Husqvarna
 
 # XML plugin configuration
 """
-<plugin key="Husqvarna" name="Husqvarna" author="Filip Demaertelaere" version="2.1.4">
+<plugin key="Husqvarna" name="Husqvarna" author="Filip Demaertelaere" version="2.1.5">
     <description>
         <h2>Husqvarna</h2>
-        <p>Version 2.1.4</p>
+        <p>Version 2.1.5</p>
         <p>The Husqvarna plugin for Domoticz provides seamless integration with your Husqvarna robotic lawnmowers. Leveraging the official Husqvarna API, this plugin allows you to monitor your mower's status and control key functions directly from your Domoticz environment. It creates virtual devices for each connected mower, offering real-time insights into its activity, battery level, cutting height, and precise location.</p>
         <br/>
         <h2>Key features</h2>
