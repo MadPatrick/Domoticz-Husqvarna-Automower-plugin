@@ -14,6 +14,7 @@ Author: Filip Demaertelaere
 # Standard imports
 import sys
 import os
+import copy
 import datetime
 import json
 import threading
@@ -40,10 +41,10 @@ import Husqvarna
 
 # XML plugin configuration
 """
-<plugin key="Husqvarna" name="Husqvarna" author="Filip Demaertelaere" version="2.1.5">
+<plugin key="Husqvarna" name="Husqvarna" author="Filip Demaertelaere" version="2.1.6">
     <description>
         <h2>Husqvarna</h2>
-        <p>Version 2.1.5</p>
+        <p>Version 2.1.6</p>
         <p>The Husqvarna plugin for Domoticz provides seamless integration with your Husqvarna robotic lawnmowers. Leveraging the official Husqvarna API, this plugin allows you to monitor your mower's status and control key functions directly from your Domoticz environment. It creates virtual devices for each connected mower, offering real-time insights into its activity, battery level, cutting height, and precise location.</p>
         <br/>
         <h2>Key features</h2>
@@ -194,9 +195,16 @@ class HusqvarnaPlugin:
         self.Husqvarna_api = None   # type: Optional[Husqvarna.Husqvarna]
         self.config = MowerConfig()
         self.tasks_queue = queue.Queue()
+        # Results computed by the QueueThread (Husqvarna API calls only) and
+        # applied to Devices[...] on the main thread in on_heartbeat().
+        self.results_queue = queue.Queue()
         self.tasks_thread = threading.Thread(
-            name='QueueThread', 
-            target=self._handle_tasks
+            name='QueueThread',
+            target=self._handle_tasks,
+            # Daemon so a slow/retry-storming task in flight when on_stop()
+            # gives up on join() can never keep the interpreter (and thus
+            # Domoticz's plugin unload) waiting for it to finish.
+            daemon=True
         )
 
     def on_start(self) -> None:
@@ -289,6 +297,19 @@ class HusqvarnaPlugin:
     def on_stop(self) -> None:
         Domoticz.Debug('onStop called')
         self.stop_requested = True
+
+        # Drop any tasks still queued but not yet picked up by the worker -
+        # shutdown shouldn't wait for a backlog of polls/retries to run out
+        # before the exit sentinel is even reached.
+        drained = 0
+        while True:
+            try:
+                self.tasks_queue.get_nowait()
+                drained += 1
+            except queue.Empty:
+                break
+        if drained:
+            Domoticz.Debug(f'Discarded {drained} not-yet-started queued task(s) on shutdown.')
 
         # Signal queue thread to exit
         self.tasks_queue.put(None)
@@ -435,6 +456,8 @@ class HusqvarnaPlugin:
         if self.stop_requested:
             return
 
+        self._apply_results()
+
         self.run_again -= 1
         if self.run_again <= 0:
             # If API not initialized, try to login
@@ -456,6 +479,35 @@ class HusqvarnaPlugin:
             if self.husqvarna_api and self.husqvarna_api.mowers:
                 self._retry_failed_commands()
                 
+    def _apply_results(self) -> None:
+        """
+        Drain results produced by the background QueueThread and perform the
+        corresponding Devices[...] mutations here, on the main thread. The
+        QueueThread (_handle_tasks/_process_task/_handle_*_task) only talks
+        to the Husqvarna Cloud API and never touches Devices[...] directly -
+        Domoticz's Devices dictionary is not thread-safe.
+        """
+        while True:
+            try:
+                result = self.results_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            kind = result[0]
+            if kind == 'timeout_all':
+                timeout_device(Devices)
+            elif kind == 'timeout_device':
+                _, mower_name = result
+                timeout_device(Devices, device_id=mower_name)
+            elif kind == 'create_devices':
+                _, mower_names = result
+                for mower_name in mower_names:
+                    self._create_mower_devices(mower_name)
+            elif kind == 'update_devices':
+                _, mowers = result
+                for mower in mowers:
+                    self._update_mower_devices(mower)
+
     def _retry_failed_commands(self) -> None:
         """Retry failed commands if they haven't exceeded retry limit."""
         if not self.husqvarna_api or not self.husqvarna_api.mowers:
@@ -660,7 +712,7 @@ class HusqvarnaPlugin:
             error = self.husqvarna_api.get_http_error() if self.husqvarna_api is not None else 'Unknown'
             Domoticz.Error(f"Unable to get credentials from Husqvarna Cloud: {error}")
             self.system_retries += 1
-            timeout_device(Devices)
+            self.results_queue.put(('timeout_all',))
 
     def _handle_get_mowers_task(self) -> None:
         """Handle retrieving the list of mowers."""
@@ -670,8 +722,6 @@ class HusqvarnaPlugin:
                 self.system_retries = 0
                 current_mowers = { mower['name'] for mower in self.husqvarna_api.mowers }
                 for mower_name in current_mowers:
-                    # Create devices if they don't exist
-                    self._create_mower_devices(mower_name)
                     # Initialize execution state
                     if mower_name not in self.execution_status:
                         self.execution_status[mower_name] = ExecutionState()
@@ -680,10 +730,13 @@ class HusqvarnaPlugin:
                 for mower_to_del in mowers_to_remove:
                     del self.execution_status[mower_to_del]
                     Domoticz.Debug(f"Removed staled execution status for mower '{mower_to_del}'.")
+                # Device creation touches Devices[...] - deferred to the main
+                # thread, applied from _apply_results() in on_heartbeat().
+                self.results_queue.put(('create_devices', current_mowers))
             else:
                 Domoticz.Error(f"Error getting list of mowers from Husqvarna Cloud: {self.husqvarna_api.get_http_error()}")
                 self.system_retries += 1
-                timeout_device(Devices)
+                self.results_queue.put(('timeout_all',))
 
     def _handle_get_status_task(self) -> None:
         """Handle retrieving current status for all mowers."""
@@ -694,13 +747,19 @@ class HusqvarnaPlugin:
                 if not self.husqvarna_api.mowers:
                     Domoticz.Error("No Husqvarna mowers available from the Husqvarna Cloud.")
                     self.system_retries += 1
-                    timeout_device(Devices)
-                for mower in self.husqvarna_api.mowers:
-                    self._update_mower_devices(mower)
+                    self.results_queue.put(('timeout_all',))
+                else:
+                    # Device updates touch Devices[...] - deferred to the main
+                    # thread, applied from _apply_results() in on_heartbeat().
+                    # Deep-copied: Husqvarna.get_mowers_info() mutates the
+                    # mower dicts in self.mowers in place, one field at a time,
+                    # so a shallow snapshot could still be half-written by the
+                    # *next* status poll while the main thread is reading it.
+                    self.results_queue.put(('update_devices', copy.deepcopy(self.husqvarna_api.mowers)))
             else:
                 Domoticz.Error(f"Error getting detailed status of mowers: {self.husqvarna_api.get_http_error()}")
                 self.system_retries += 1
-                timeout_device(Devices)
+                self.results_queue.put(('timeout_all',))
 
     def _update_mower_devices(self, mower: Dict[str, Any]) -> None:
         """
@@ -1077,7 +1136,7 @@ class HusqvarnaPlugin:
                 self.execution_status[mower_name].status = ExecutionStatus.DONE.value
             else:
                 Domoticz.Error(f"Error executing {action} on {mower_name}: {self.husqvarna_api.get_http_error()}")
-                timeout_device(Devices, device_id=mower_name)
+                self.results_queue.put(('timeout_device', mower_name))
                 self.execution_status[mower_name].status = ExecutionStatus.ERROR.value
                 
             # Request quick status update after command
