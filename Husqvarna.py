@@ -331,8 +331,12 @@ class Husqvarna:
         Returns:
             httpx.Client: Configured HTTP client
         """
+        # verify defaults to True (httpx's default): unlike a local hub with
+        # a self-signed certificate, api.authentication.husqvarnagroup.dev
+        # and api.amc.husqvarna.dev are public endpoints with CA-signed
+        # certificates, so there's no reason to skip verification - doing so
+        # would also silently accept a MITM'd OAuth token exchange.
         return httpx.Client(
-            verify=False,
             headers={
                 'x-api-key': self.client_id,
                 'accept': 'application/vnd.api+json'
